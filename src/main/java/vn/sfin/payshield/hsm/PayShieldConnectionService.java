@@ -2,16 +2,19 @@ package vn.sfin.payshield.hsm;
 
 
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
-import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 
 @Slf4j
 @Service
 public class PayShieldConnectionService {
+
+    @Autowired
+    PayShieldConnectionPool payShieldConnectPool;
 
     private final PayShieldConfig config;
 
@@ -21,22 +24,33 @@ public class PayShieldConnectionService {
                 config.getHost(), config.getPort());
     }
 
-    /**
-     * Gửi command tới PayShield 10K HSM
-     * @param command Command cần gửi (không bao gồm header)
-     * @return Response từ HSM (bao gồm header)
-     */
     public String sendCommand(String command) {
         int retries = 0;
         Exception lastException = null;
 
         while (retries < config.getMaxRetries()) {
+            PayShieldConnectionPool.HSMConnection connection = null;
             try {
-                return executeCommand(command);
+                // Lấy connection từ pool
+                connection = payShieldConnectPool.borrowConnection();
+
+                // Thực thi command
+                String response = executeCommand(connection, command);
+
+                // Trả connection về pool
+                payShieldConnectPool.returnConnection(connection);
+
+                return response;
+
             } catch (Exception e) {
                 lastException = e;
                 retries++;
                 log.warn("Attempt {}/{} failed: {}", retries, config.getMaxRetries(), e.getMessage());
+
+                // Trả connection về pool (sẽ được validate và recreate nếu cần)
+                if (connection != null) {
+                    payShieldConnectPool.returnConnection(connection);
+                }
 
                 if (retries < config.getMaxRetries()) {
                     try {
@@ -55,42 +69,33 @@ public class PayShieldConnectionService {
     }
 
     /**
-     * Thực thi command
+     * Thực thi command với connection có sẵn
      */
-    private String executeCommand(String command) {
-        log.debug("Connecting to HSM at {}:{}", config.getHost(), config.getPort());
+    private String executeCommand(PayShieldConnectionPool.HSMConnection connection,
+                                  String command) throws Exception {
+        log.debug("Executing command: {}", command);
 
-        try (Socket socket = new Socket(config.getHost(), config.getPort())) {
-            socket.setSoTimeout(config.getTimeout());
-            socket.setKeepAlive(true);
-            socket.setTcpNoDelay(true);
+        DataOutputStream out = connection.getOutputStream();
+        DataInputStream in = connection.getInputStream();
 
-            DataOutputStream out = new DataOutputStream(socket.getOutputStream());
-            DataInputStream in = new DataInputStream(socket.getInputStream());
+        // Format message với 4-byte hex header
+        String fullMessage = formatMessage(command);
 
-            // Format message với 4-byte hex header
-            String fullMessage = formatMessage(command);
+        log.debug("Sending command: {}", command);
+        log.debug("Full message (with header): {}", fullMessage);
 
-            log.debug("Sending command: {}", command);
-            log.debug("Full message (with header): {}", fullMessage);
+        // Gửi message
+        out.write(fullMessage.getBytes(StandardCharsets.US_ASCII));
+        out.flush();
 
-            // Gửi message
-            out.write(fullMessage.getBytes(StandardCharsets.US_ASCII));
-            out.flush();
+        log.debug("Command sent successfully");
 
-            log.debug("Command sent successfully");
+        // Đọc response
+        String response = readResponse(in);
 
-            // Đọc response
-            String response = readResponse(in);
+        log.debug("Response received: {}", response);
 
-            log.debug("Response received: {}", response);
-
-            return response;
-
-        } catch (Exception e) {
-            log.error("Error executing command: {}", e.getMessage());
-            throw new RuntimeException("HSM communication error", e);
-        }
+        return response;
     }
 
     /**
@@ -107,37 +112,30 @@ public class PayShieldConnectionService {
      * Đọc response từ HSM
      * Response format: [4-byte hex header][response body]
      */
-    private String readResponse(DataInputStream in) {
-        try {
-            // Đọc header (4 bytes hex)
-            byte[] headerBytes = new byte[config.getHeaderLength()];
-            in.readFully(headerBytes);
+    private String readResponse(DataInputStream in) throws Exception {
+        // Đọc header (4 bytes hex)
+        byte[] headerBytes = new byte[config.getHeaderLength()];
+        in.readFully(headerBytes);
 
-            String header = new String(headerBytes, StandardCharsets.US_ASCII);
+        String header = new String(headerBytes, StandardCharsets.US_ASCII);
 
-            // Parse hex header để lấy message length
-            int messageLength = Integer.parseInt(header, 16);
+        // Parse hex header để lấy message length
+        int messageLength = Integer.parseInt(header, 16);
 
-            log.debug("Response header: {} (length: {} bytes)", header, messageLength);
+        log.debug("Response header: {} (length: {} bytes)", header, messageLength);
 
-            if (messageLength <= 0 || messageLength > 10000) {
-                log.error("Invalid message length: {}", messageLength);
-                return null;
-            }
-
-            // Đọc message body
-            byte[] messageBytes = new byte[messageLength];
-            in.readFully(messageBytes);
-
-            String messageBody = new String(messageBytes, StandardCharsets.US_ASCII);
-
-            // Return full response (header + body)
-            return header + messageBody;
-
-        } catch (Exception e) {
-            log.error("Error reading response: {}", e.getMessage());
-            return null;
+        if (messageLength <= 0 || messageLength > 10000) {
+            throw new Exception("Invalid message length: " + messageLength);
         }
+
+        // Đọc message body
+        byte[] messageBytes = new byte[messageLength];
+        in.readFully(messageBytes);
+
+        String messageBody = new String(messageBytes, StandardCharsets.US_ASCII);
+
+        // Return full response (header + body)
+        return header + messageBody;
     }
 
     /**
@@ -178,4 +176,12 @@ public class PayShieldConnectionService {
             return false;
         }
     }
+
+    /**
+     * Get connection pool status
+     */
+    public PayShieldConnectionPool.PoolStatus getPoolStatus() {
+        return payShieldConnectPool.getStatus();
+    }
+
 }
